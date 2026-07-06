@@ -39,12 +39,19 @@ import java.util.Locale
  * One recorded fix. GPS naturally gives latitude/longitude/altitude; we
  * treat those as x/y/z per the debug spec (x = latitude, y = longitude,
  * z = altitude in meters).
+ *
+ * horizontalAccuracyM is a single 68%-confidence radius that covers x and y
+ * together (GPS doesn't report separate confidence for latitude vs
+ * longitude) — null if the platform/fix didn't report one.
+ * verticalAccuracyM is the equivalent for z — null if unavailable.
  */
 data class TrackPoint(
     val timestampMillis: Long,
     val x: Double,
     val y: Double,
     val z: Double,
+    val horizontalAccuracyM: Float?,
+    val verticalAccuracyM: Float?,
 )
 
 class MainActivity : ComponentActivity() {
@@ -130,6 +137,8 @@ class MainActivity : ComponentActivity() {
                 x = location.latitude,
                 y = location.longitude,
                 z = location.altitude,
+                horizontalAccuracyM = if (location.hasAccuracy()) location.accuracy else null,
+                verticalAccuracyM = if (location.hasVerticalAccuracy()) location.verticalAccuracyMeters else null,
             ),
         )
     }
@@ -169,5 +178,9 @@ private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
 
 private fun formatPoint(point: TrackPoint): String {
     val time = timeFormat.format(Date(point.timestampMillis))
-    return "[$time] x=%.6f  y=%.6f  z=%.2f".format(point.x, point.y, point.z)
+    val hAcc = point.horizontalAccuracyM?.let { "±%.1fm".format(it) } ?: "±?"
+    val vAcc = point.verticalAccuracyM?.let { "±%.1fm".format(it) } ?: "±?"
+    return "[$time] x=%.6f  y=%.6f  (%s)   z=%.2f  (%s)".format(
+        point.x, point.y, hAcc, point.z, vAcc,
+    )
 }

@@ -31,6 +31,15 @@ android {
         versionCode = ciVersionCode ?: 1
         versionName = ciVersionName ?: error("appVersionName must be set via -PappVersionName")
         resValue("string", "app_name", appName)
+
+        // Never hardcode/commit the key. Pass it at build time with
+        // -PelevationApiKey=... or the ELEVATION_API_KEY env var. Empty by
+        // default, in which case the app falls back to raw uncorrected
+        // barometer readings (see MainActivity.processSession).
+        val elevationApiKey = (project.findProperty("elevationApiKey") as String?)
+            ?: System.getenv("ELEVATION_API_KEY")
+            ?: ""
+        buildConfigField("String", "ELEVATION_API_KEY", "\"$elevationApiKey\"")
     }
 
     buildTypes {
@@ -58,6 +67,7 @@ android {
     buildFeatures {
         compose = true
         resValues = true
+        buildConfig = true
     }
 }
 

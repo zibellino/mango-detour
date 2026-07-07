@@ -3,10 +3,11 @@
 
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <!-- Lets the fused provider use Wi-Fi/cell scans for the horizontal fix
-         even when GNSS is weak or unavailable (e.g. indoors). -->
+    <!-- Lets the fused provider use Wi-Fi/cell scans for x/y, and lets the
+         app call the Elevation API over the network for barometer drift
+         correction. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="true"

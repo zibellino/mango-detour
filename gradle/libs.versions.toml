@@ -6,8 +6,10 @@ lifecycleRuntimeKtx = "2.9.1"
 activityCompose = "1.13.0"
 composeBom = "2026.05.01"
 appcompat = "1.7.1"
+playServicesLocation = "21.3.0"
 
 [libraries]
+play-services-location = { group = "com.google.android.gms", name = "play-services-location", version.ref = "playServicesLocation" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }

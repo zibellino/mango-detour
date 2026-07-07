@@ -160,6 +160,7 @@ class MainActivity : ComponentActivity() {
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
         pressureSensor = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
+        ElevationClient.init(this)
 
         setContent {
             MaterialTheme {
@@ -168,7 +169,6 @@ class MainActivity : ComponentActivity() {
                         isRecording = isRecording,
                         isProcessing = isProcessing,
                         hasBarometer = pressureSensor != null,
-                        hasApiKey = BuildConfig.ELEVATION_API_KEY.isNotBlank(),
                         rawPingCount = rawPingCount,
                         residualRmsM = residualRmsM,
                         points = correctedPoints,
@@ -359,7 +359,6 @@ private fun RecorderScreen(
     isRecording: Boolean,
     isProcessing: Boolean,
     hasBarometer: Boolean,
-    hasApiKey: Boolean,
     rawPingCount: Int,
     residualRmsM: Double?,
     points: List<CorrectedPoint>,
@@ -384,10 +383,6 @@ private fun RecorderScreen(
 
         if (!hasBarometer) {
             Text("No barometer on this device — elevation correction is unavailable.")
-            Spacer(modifier = Modifier.height(8.dp))
-        }
-        if (!hasApiKey) {
-            Text("No ELEVATION_API_KEY configured — falls back to raw, uncorrected barometer readings.")
             Spacer(modifier = Modifier.height(8.dp))
         }
 

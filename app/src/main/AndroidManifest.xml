@@ -4,8 +4,8 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- Lets the fused provider use Wi-Fi/cell scans for x/y, and lets the
-         app call the Elevation API over the network for barometer drift
-         correction. -->
+         app download SRTM elevation tiles (cached locally after first use)
+         for barometer drift correction. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.INTERNET" />
 

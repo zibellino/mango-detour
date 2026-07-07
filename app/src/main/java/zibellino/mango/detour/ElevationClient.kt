@@ -1,57 +1,37 @@
 package zibellino.mango.detour
 
-import android.net.Uri
+import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
- * Thin client for the Google Maps Elevation API — a lookup of DEM
- * (SRTM/Copernicus-derived) ground elevation for a given lat/lon. This is
- * a ground-truth *reference*, not a live sensor: it's only as fine as the
- * underlying ~30m grid, interpolated. Its job here is purely to give the
- * barometer something stable to anchor its drifting bias against.
+ * Ground elevation lookup for the barometer's drift-correction fit — now
+ * backed by locally-cached SRTM tiles instead of a paid, key-gated API.
  *
- * Requires ELEVATION_API_KEY to be set (see build.gradle.kts) and the
- * Elevation API enabled + billing set up on that Google Cloud project.
+ * The first lookup in a new ~1x1 degree area triggers a one-time tile
+ * download from AWS's public "elevation-tiles-prod" bucket (no key, no
+ * billing, no account). Every lookup after that in the same area is a
+ * local file read — no network, no rate limit, no per-caller quota.
+ *
+ * This is a ground-truth *reference*, not a live sensor: it's only as
+ * fine as the underlying ~30m SRTM grid, interpolated. Its job here is
+ * purely to give the barometer something stable to anchor its drifting
+ * bias against (see MainActivity.processSession).
  */
 object ElevationClient {
+
+    private var provider: SrtmElevationProvider? = null
+
+    /** Call once, e.g. from Activity.onCreate, before the first fetchElevation call. */
+    fun init(context: Context) {
+        if (provider == null) {
+            provider = SrtmElevationProvider(context.applicationContext)
+        }
+    }
 
     /** Returns ground elevation in meters, or null if the lookup failed. */
     suspend fun fetchElevation(latitude: Double, longitude: Double): Double? =
         withContext(Dispatchers.IO) {
-            if (BuildConfig.ELEVATION_API_KEY.isBlank()) return@withContext null
-
-            try {
-                val uri = Uri.parse("https://maps.googleapis.com/maps/api/elevation/json")
-                    .buildUpon()
-                    .appendQueryParameter("locations", "$latitude,$longitude")
-                    .appendQueryParameter("key", BuildConfig.ELEVATION_API_KEY)
-                    .build()
-
-                val connection = URL(uri.toString()).openConnection() as HttpURLConnection
-                connection.connectTimeout = 8_000
-                connection.readTimeout = 8_000
-                connection.requestMethod = "GET"
-
-                val body = connection.inputStream.use { stream ->
-                    BufferedReader(InputStreamReader(stream)).readText()
-                }
-                connection.disconnect()
-
-                val json = JSONObject(body)
-                if (json.optString("status") != "OK") return@withContext null
-
-                val results = json.optJSONArray("results") ?: return@withContext null
-                if (results.length() == 0) return@withContext null
-
-                results.getJSONObject(0).optDouble("elevation").takeIf { !it.isNaN() }
-            } catch (e: Exception) {
-                null
-            }
+            provider?.getElevation(latitude, longitude)
         }
 }

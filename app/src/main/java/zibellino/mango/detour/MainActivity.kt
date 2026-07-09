@@ -44,87 +44,27 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.cos
+
+private const val LOG_INTERVAL_MS = 10_000L
+private const val METERS_PER_DEGREE_LAT = 111_320.0
 
 /**
- * A single raw sample taken during a recording session, before any
- * correction is applied.
- *
- * x/y come from Fused Location (GNSS blended with Wi-Fi/cell) — altitude
- * from that provider is intentionally never read; it's too weak to be
- * worth combining with the barometer once the Elevation API is in play.
- *
- * baroAltitude is the barometer's raw reading (SensorManager.getAltitude
- * against the standard sea-level pressure constant) — it drifts with
- * weather but captures real elevation *change* faithfully in the short
- * term, which is exactly what we want it for.
- *
- * apiElevation is the Elevation API's ground-truth lookup for (x, y) at
- * the moment of this ping — a DEM value, accurate to roughly 1-4m in flat
- * terrain, used purely to correct the barometer's drift, never as a
- * live position source itself.
+ * One raw, unprocessed log row. Every field is logged as-is from its
+ * source — no filtering, no fusion, no correction. The point of this
+ * screen is to eyeball how the three altitude sources actually agree or
+ * disagree in practice before writing any correction logic.
  */
-data class PingSample(
+data class LogRow(
     val timestampMillis: Long,
-    val x: Double,
-    val y: Double,
-    val baroAltitude: Double,
-    val apiElevation: Double?,
+    val lat: Double,
+    val lng: Double,
+    val xMeters: Double,
+    val yMeters: Double,
+    val gpsAltitude: Double?,
+    val baroAltitude: Double?,
+    val srtmElevation: Double?,
 )
-
-/**
- * A ping after post-session correction.
- *
- * correctedZ = baroAltitude - fittedOffset, where fittedOffset is a
- * regression fit of (baroAltitude - apiElevation) over time across the
- * whole session. Real elevation change cancels out of that subtraction
- * (it's present in both baroAltitude and apiElevation), so only sensor
- * bias/drift and per-point DEM noise remain to be fitted and removed.
- */
-data class CorrectedPoint(
-    val timestampMillis: Long,
-    val x: Double,
-    val y: Double,
-    val correctedZ: Double,
-)
-
-/** Least-squares fit of offset(t) = intercept + slope * t. */
-private data class LinearFit(val intercept: Double, val slope: Double, val residualRmsM: Double)
-
-private fun fitLinearDrift(points: List<Pair<Double, Double>>): LinearFit {
-    // points: (tSeconds, offset)
-    if (points.size < 2) {
-        val flat = points.firstOrNull()?.second ?: 0.0
-        return LinearFit(intercept = flat, slope = 0.0, residualRmsM = 0.0)
-    }
-
-    val n = points.size
-    val sumT = points.sumOf { it.first }
-    val sumO = points.sumOf { it.second }
-    val meanT = sumT / n
-    val meanO = sumO / n
-
-    var covariance = 0.0
-    var variance = 0.0
-    for ((t, o) in points) {
-        covariance += (t - meanT) * (o - meanO)
-        variance += (t - meanT) * (t - meanT)
-    }
-
-    val slope = if (variance > 1e-9) covariance / variance else 0.0
-    val intercept = meanO - slope * meanT
-
-    var residualSquaredSum = 0.0
-    for ((t, o) in points) {
-        val fitted = intercept + slope * t
-        val residual = o - fitted
-        residualSquaredSum += residual * residual
-    }
-    val residualRms = kotlin.math.sqrt(residualSquaredSum / n)
-
-    return LinearFit(intercept, slope, residualRms)
-}
-
-private const val PING_INTERVAL_MS = 5_000L
 
 class MainActivity : ComponentActivity() {
 
@@ -132,21 +72,23 @@ class MainActivity : ComponentActivity() {
     private lateinit var sensorManager: SensorManager
     private var pressureSensor: Sensor? = null
 
-    private val pingHandler = Handler(Looper.getMainLooper())
-    private var pingRunnable: Runnable? = null
+    private val logHandler = Handler(Looper.getMainLooper())
+    private var logRunnable: Runnable? = null
 
     private var latestLocation: Location? = null
     private var latestBaroAltitude: Double? = null
 
+    // First fix of the session; xMeters/yMeters are a flat local-plane
+    // approximation (equirectangular projection) relative to this, valid
+    // for the small distances a walking/driving session covers.
+    private var originLat: Double? = null
+    private var originLon: Double? = null
+
     private var locationCallback: LocationCallback? = null
     private var sensorListener: SensorEventListener? = null
 
-    private val rawPings = mutableListOf<PingSample>()
+    private val logRows = mutableStateListOf<LogRow>()
     private var isRecording by mutableStateOf(false)
-    private var isProcessing by mutableStateOf(false)
-    private var rawPingCount by mutableStateOf(0)
-    private var residualRmsM by mutableStateOf<Double?>(null)
-    private val correctedPoints = mutableStateListOf<CorrectedPoint>()
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -167,11 +109,8 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     RecorderScreen(
                         isRecording = isRecording,
-                        isProcessing = isProcessing,
                         hasBarometer = pressureSensor != null,
-                        rawPingCount = rawPingCount,
-                        residualRmsM = residualRmsM,
-                        points = correctedPoints,
+                        rows = logRows,
                         onToggle = ::onToggleClicked,
                     )
                 }
@@ -181,7 +120,7 @@ class MainActivity : ComponentActivity() {
 
     private fun onToggleClicked() {
         if (isRecording) {
-            stopRecordingAndProcess()
+            stopRecording()
             return
         }
 
@@ -198,15 +137,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun beginRecording() {
-        rawPings.clear()
-        correctedPoints.clear()
-        rawPingCount = 0
-        residualRmsM = null
+        logRows.clear()
         latestLocation = null
         latestBaroAltitude = null
+        originLat = null
+        originLon = null
 
-        // Barometer: keep only the latest raw reading. No filtering here —
-        // correction happens entirely in post-processing.
+        // Barometer: keep only the latest raw reading, nothing else.
         pressureSensor?.let { sensor ->
             val listener = object : SensorEventListener {
                 override fun onSensorChanged(event: SensorEvent) {
@@ -222,8 +159,6 @@ class MainActivity : ComponentActivity() {
             sensorManager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_UI)
         }
 
-        // Fused location for x/y only — altitude from this provider is
-        // never read.
         val hasPermission = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.ACCESS_FINE_LOCATION,
@@ -249,105 +184,79 @@ class MainActivity : ComponentActivity() {
         }
 
         isRecording = true
-        schedulePing()
+        scheduleLogging()
     }
 
-    /** Every PING_INTERVAL_MS: snapshot x/y + barometer, look up ground elevation, log raw. */
-    private fun schedulePing() {
+    private fun scheduleLogging() {
         val runnable = object : Runnable {
             override fun run() {
-                takePing()
-                pingHandler.postDelayed(this, PING_INTERVAL_MS)
+                takeLogRow()
+                logHandler.postDelayed(this, LOG_INTERVAL_MS)
             }
         }
-        pingRunnable = runnable
-        pingHandler.postDelayed(runnable, PING_INTERVAL_MS)
+        logRunnable = runnable
+        logHandler.postDelayed(runnable, LOG_INTERVAL_MS)
     }
 
-    private fun takePing() {
+    private fun takeLogRow() {
         val location = latestLocation ?: return
-        val baro = latestBaroAltitude ?: return
+        val lat = location.latitude
+        val lng = location.longitude
+
+        if (originLat == null) {
+            originLat = lat
+            originLon = lng
+        }
+
+        val (xMeters, yMeters) = localMeters(lat, lng)
+        val gpsAltitude = if (location.hasAltitude()) location.altitude else null
+        val baro = latestBaroAltitude
         val timestamp = System.currentTimeMillis()
-        val x = location.latitude
-        val y = location.longitude
 
         lifecycleScope.launch {
-            val apiElevation = ElevationClient.fetchElevation(x, y)
-            rawPings.add(
-                PingSample(
+            val srtmElevation = ElevationClient.fetchElevation(lat, lng)
+            logRows.add(
+                0,
+                LogRow(
                     timestampMillis = timestamp,
-                    x = x,
-                    y = y,
+                    lat = lat,
+                    lng = lng,
+                    xMeters = xMeters,
+                    yMeters = yMeters,
+                    gpsAltitude = gpsAltitude,
                     baroAltitude = baro,
-                    apiElevation = apiElevation,
+                    srtmElevation = srtmElevation,
                 ),
             )
-            rawPingCount = rawPings.size
         }
     }
 
-    private fun stopRecordingAndProcess() {
-        pingRunnable?.let { pingHandler.removeCallbacks(it) }
-        pingRunnable = null
+    /**
+     * Flat local-plane approximation relative to the session's first fix
+     * (equirectangular projection). Fine for the scale of a single
+     * session; not meant for anything spanning a large area.
+     */
+    private fun localMeters(lat: Double, lng: Double): Pair<Double, Double> {
+        val oLat = originLat ?: lat
+        val oLon = originLon ?: lng
+        val metersPerDegreeLon = METERS_PER_DEGREE_LAT * cos(Math.toRadians(oLat))
+        val xMeters = (lng - oLon) * metersPerDegreeLon
+        val yMeters = (lat - oLat) * METERS_PER_DEGREE_LAT
+        return xMeters to yMeters
+    }
+
+    private fun stopRecording() {
+        logRunnable?.let { logHandler.removeCallbacks(it) }
+        logRunnable = null
         locationCallback?.let { fusedLocationClient.removeLocationUpdates(it) }
         locationCallback = null
         sensorListener?.let { sensorManager.unregisterListener(it) }
         sensorListener = null
         isRecording = false
-        isProcessing = true
-
-        lifecycleScope.launch {
-            processSession()
-            isProcessing = false
-        }
-    }
-
-    /**
-     * offset(t) = baroAltitude(t) - apiElevation(t) for every ping that got
-     * a valid Elevation API result. True elevation change is present in
-     * both terms and cancels out, leaving barometer bias/drift plus
-     * per-point DEM noise — exactly what we want the regression to model
-     * and remove. correctedZ = baroAltitude - fittedOffset(t).
-     */
-    private fun processSession() {
-        val usablePings = rawPings.filter { it.apiElevation != null }
-        if (usablePings.isEmpty()) {
-            // No successful Elevation API lookups (e.g. no network, no API
-            // key, or every request failed) — fall back to raw barometer
-            // readings with no drift correction, since that's still better
-            // than nothing.
-            correctedPoints.clear()
-            correctedPoints.addAll(
-                rawPings.map {
-                    CorrectedPoint(it.timestampMillis, it.x, it.y, it.baroAltitude)
-                },
-            )
-            residualRmsM = null
-            return
-        }
-
-        val startMillis = usablePings.first().timestampMillis
-        val fitInput = usablePings.map { ping ->
-            val tSeconds = (ping.timestampMillis - startMillis) / 1000.0
-            val offset = ping.baroAltitude - ping.apiElevation!!
-            tSeconds to offset
-        }
-        val fit = fitLinearDrift(fitInput)
-
-        correctedPoints.clear()
-        correctedPoints.addAll(
-            rawPings.map { ping ->
-                val tSeconds = (ping.timestampMillis - startMillis) / 1000.0
-                val fittedOffset = fit.intercept + fit.slope * tSeconds
-                val correctedZ = ping.baroAltitude - fittedOffset
-                CorrectedPoint(ping.timestampMillis, ping.x, ping.y, correctedZ)
-            },
-        )
-        residualRmsM = fit.residualRmsM
     }
 
     override fun onDestroy() {
-        pingRunnable?.let { pingHandler.removeCallbacks(it) }
+        logRunnable?.let { logHandler.removeCallbacks(it) }
         locationCallback?.let { fusedLocationClient.removeLocationUpdates(it) }
         sensorListener?.let { sensorManager.unregisterListener(it) }
         super.onDestroy()
@@ -357,49 +266,30 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun RecorderScreen(
     isRecording: Boolean,
-    isProcessing: Boolean,
     hasBarometer: Boolean,
-    rawPingCount: Int,
-    residualRmsM: Double?,
-    points: List<CorrectedPoint>,
+    rows: List<LogRow>,
     onToggle: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Button(
-            onClick = onToggle,
-            enabled = !isProcessing,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(
-                when {
-                    isProcessing -> "Processing..."
-                    isRecording -> "Stop Recording"
-                    else -> "Start Recording"
-                },
-            )
+        Button(onClick = onToggle, modifier = Modifier.fillMaxWidth()) {
+            Text(if (isRecording) "Stop Recording" else "Start Recording")
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
         if (!hasBarometer) {
-            Text("No barometer on this device — elevation correction is unavailable.")
+            Text("No barometer on this device — baroAltitude will always be blank.")
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        if (isRecording) {
-            Text("Raw pings logged: $rawPingCount")
-        } else {
-            Text("Corrected points: ${points.size}")
-            residualRmsM?.let {
-                Text("Drift-fit residual: ±%.2fm (1-sigma, this session)".format(it))
-            }
-        }
+        Text("Rows logged: ${rows.size}")
 
         Spacer(modifier = Modifier.height(8.dp))
 
         LazyColumn {
-            items(points) { point ->
-                Text(formatPoint(point))
+            items(rows) { row ->
+                Text(formatRow(row))
+                Spacer(modifier = Modifier.height(6.dp))
             }
         }
     }
@@ -407,7 +297,11 @@ private fun RecorderScreen(
 
 private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
 
-private fun formatPoint(point: CorrectedPoint): String {
-    val time = timeFormat.format(Date(point.timestampMillis))
-    return "[$time] x=%.6f  y=%.6f  z=%.2f".format(point.x, point.y, point.correctedZ)
+private fun formatRow(row: LogRow): String {
+    val time = timeFormat.format(Date(row.timestampMillis))
+    val gps = row.gpsAltitude?.let { "%.2f".format(it) } ?: "-"
+    val baro = row.baroAltitude?.let { "%.2f".format(it) } ?: "-"
+    val srtm = row.srtmElevation?.let { "%.2f".format(it) } ?: "-"
+    return "[$time] lat=%.6f lng=%.6f  x=%.1fm y=%.1fm\n  gpsAlt=$gps  baroAlt=$baro  srtmElev=$srtm"
+        .format(row.lat, row.lng, row.xMeters, row.yMeters)
 }

@@ -41,6 +41,7 @@ import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import kotlinx.coroutines.launch
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -65,6 +66,7 @@ data class LogRow(
     val xMeters: Double,
     val yMeters: Double,
     val gpsAltitude: Double?,
+    val correctedGpsAltitude: Double?,
     val baroAltitude: Double?,
     val srtmElevation: Double?,
 )
@@ -74,6 +76,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var sensorManager: SensorManager
     private var pressureSensor: Sensor? = null
+    private lateinit var geoidModel: GeoidModel
 
     private val logHandler = Handler(Looper.getMainLooper())
     private var logRunnable: Runnable? = null
@@ -108,6 +111,7 @@ class MainActivity : ComponentActivity() {
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
         pressureSensor = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
         ElevationClient.init(this)
+        geoidModel = GeoidModel(this)
 
         setContent {
             MaterialTheme {
@@ -229,6 +233,7 @@ class MainActivity : ComponentActivity() {
 
         val (xMeters, yMeters) = localMeters(lat, lng)
         val gpsAltitude = if (location.hasAltitude()) location.altitude else null
+        val correctedGpsAltitude = gpsAltitude?.let { it - geoidModel.undulationMeters(lat, lng) }
         val baro = latestBaroAltitude
         val timestamp = System.currentTimeMillis()
 
@@ -243,6 +248,7 @@ class MainActivity : ComponentActivity() {
                     xMeters = xMeters,
                     yMeters = yMeters,
                     gpsAltitude = gpsAltitude,
+                    correctedGpsAltitude = correctedGpsAltitude,
                     baroAltitude = baro,
                     srtmElevation = srtmElevation,
                 ),
@@ -269,6 +275,30 @@ class MainActivity : ComponentActivity() {
         logRunnable = null
         isRecording = false
         // GNSS + barometer keep running (warm) in case the user starts again.
+        saveSessionLog()
+    }
+
+    /**
+     * Writes every logged row, oldest first, as plain text — the same
+     * format shown on screen — to the app's external files directory
+     * (Android/data/zibellino.mango.detour/files/), one file per session.
+     * No special storage permission needed on modern Android since this
+     * is app-scoped external storage.
+     */
+    private fun saveSessionLog() {
+        if (logRows.isEmpty()) return
+        val dir = getExternalFilesDir(null) ?: return
+        val filename = "session_${fileTimeFormat.format(Date())}.log"
+        try {
+            File(dir, filename).bufferedWriter().use { writer ->
+                logRows.asReversed().forEach { row ->
+                    writer.write(formatRow(row))
+                    writer.newLine()
+                }
+            }
+        } catch (e: Exception) {
+            // Best-effort — a failed save shouldn't crash the session.
+        }
     }
 
     override fun onDestroy() {
@@ -329,12 +359,14 @@ private fun RecorderScreen(
 }
 
 private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
+private val fileTimeFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
 private fun formatRow(row: LogRow): String {
     val time = timeFormat.format(Date(row.timestampMillis))
     val gps = row.gpsAltitude?.let { "%.2f".format(it) } ?: "-"
+    val gpsCorrected = row.correctedGpsAltitude?.let { "%.2f".format(it) } ?: "-"
     val baro = row.baroAltitude?.let { "%.2f".format(it) } ?: "-"
     val srtm = row.srtmElevation?.let { "%.2f".format(it) } ?: "-"
-    return "[$time] lat=%.6f lng=%.6f  x=%.1fm y=%.1fm\n  gpsAlt=$gps  baroAlt=$baro  srtmElev=$srtm"
+    return "[$time] lat=%.6f lng=%.6f  x=%.1fm y=%.1fm\n  gpsAlt=$gps  gpsAltCorrected=$gpsCorrected  baroAlt=$baro  srtmElev=$srtm"
         .format(row.lat, row.lng, row.xMeters, row.yMeters)
 }

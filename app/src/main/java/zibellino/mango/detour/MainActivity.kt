@@ -46,8 +46,11 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.cos
 
-private const val LOG_INTERVAL_MS = 10_000L
+private const val LOG_INTERVAL_MS = 5_000L
 private const val METERS_PER_DEGREE_LAT = 111_320.0
+
+/** Minimum horizontal accuracy (meters) before we let the user start recording. */
+private const val READY_ACCURACY_THRESHOLD_M = 10f
 
 /**
  * One raw, unprocessed log row. Every field is logged as-is from its
@@ -89,11 +92,13 @@ class MainActivity : ComponentActivity() {
 
     private val logRows = mutableStateListOf<LogRow>()
     private var isRecording by mutableStateOf(false)
+    private var isLocationReady by mutableStateOf(false)
+    private var currentAccuracyM by mutableStateOf<Float?>(null)
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) {
-                beginRecording()
+                startSensorWarmup()
             }
         }
 
@@ -109,19 +114,14 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     RecorderScreen(
                         isRecording = isRecording,
+                        isLocationReady = isLocationReady,
+                        currentAccuracyM = currentAccuracyM,
                         hasBarometer = pressureSensor != null,
                         rows = logRows,
                         onToggle = ::onToggleClicked,
                     )
                 }
             }
-        }
-    }
-
-    private fun onToggleClicked() {
-        if (isRecording) {
-            stopRecording()
-            return
         }
 
         val hasPermission = ContextCompat.checkSelfPermission(
@@ -130,20 +130,21 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
 
         if (hasPermission) {
-            beginRecording()
+            startSensorWarmup()
         } else {
             requestPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
         }
     }
 
-    private fun beginRecording() {
-        logRows.clear()
-        latestLocation = null
-        latestBaroAltitude = null
-        originLat = null
-        originLon = null
-
-        // Barometer: keep only the latest raw reading, nothing else.
+    /**
+     * Starts GNSS and the barometer as soon as we have permission — well
+     * before the user taps "Start Recording" — so both have had time to
+     * warm up (GNSS convergence, barometer's first few samples) by the
+     * time recording actually begins. isLocationReady gates the Start
+     * button so the user isn't recording garbage fixes from a cold GNSS
+     * lock (see the ~20s convergence jump in earlier logs).
+     */
+    private fun startSensorWarmup() {
         pressureSensor?.let { sensor ->
             val listener = object : SensorEventListener {
                 override fun onSensorChanged(event: SensorEvent) {
@@ -165,13 +166,16 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
         if (!hasPermission) return
 
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5_000L)
-            .setMinUpdateIntervalMillis(2_000L)
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2_000L)
+            .setMinUpdateIntervalMillis(1_000L)
             .build()
 
         val callback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
-                result.lastLocation?.let { latestLocation = it }
+                val location = result.lastLocation ?: return
+                latestLocation = location
+                currentAccuracyM = if (location.hasAccuracy()) location.accuracy else null
+                isLocationReady = location.hasAccuracy() && location.accuracy <= READY_ACCURACY_THRESHOLD_M
             }
         }
         locationCallback = callback
@@ -180,10 +184,25 @@ class MainActivity : ComponentActivity() {
             fusedLocationClient.requestLocationUpdates(request, callback, Looper.getMainLooper())
         } catch (e: SecurityException) {
             locationCallback = null
+        }
+    }
+
+    private fun onToggleClicked() {
+        if (isRecording) {
+            stopRecording()
             return
         }
+        if (!isLocationReady) return
+        beginRecording()
+    }
+
+    private fun beginRecording() {
+        logRows.clear()
+        originLat = null
+        originLon = null
 
         isRecording = true
+        takeLogRow() // log immediately, then settle into the periodic interval
         scheduleLogging()
     }
 
@@ -248,11 +267,8 @@ class MainActivity : ComponentActivity() {
     private fun stopRecording() {
         logRunnable?.let { logHandler.removeCallbacks(it) }
         logRunnable = null
-        locationCallback?.let { fusedLocationClient.removeLocationUpdates(it) }
-        locationCallback = null
-        sensorListener?.let { sensorManager.unregisterListener(it) }
-        sensorListener = null
         isRecording = false
+        // GNSS + barometer keep running (warm) in case the user starts again.
     }
 
     override fun onDestroy() {
@@ -266,16 +282,33 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun RecorderScreen(
     isRecording: Boolean,
+    isLocationReady: Boolean,
+    currentAccuracyM: Float?,
     hasBarometer: Boolean,
     rows: List<LogRow>,
     onToggle: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Button(onClick = onToggle, modifier = Modifier.fillMaxWidth()) {
-            Text(if (isRecording) "Stop Recording" else "Start Recording")
+        Button(
+            onClick = onToggle,
+            enabled = isRecording || isLocationReady,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                when {
+                    isRecording -> "Stop Recording"
+                    isLocationReady -> "Start Recording"
+                    else -> "Waiting for GPS fix..."
+                },
+            )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
+
+        currentAccuracyM?.let {
+            Text("Current fix accuracy: ±%.1fm".format(it))
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         if (!hasBarometer) {
             Text("No barometer on this device — baroAltitude will always be blank.")

@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
@@ -69,6 +68,10 @@ private const val VERTICAL_ACCURACY_FALLBACK_MULTIPLIER = 1.75f
 private const val SRTM_VERTICAL_STDDEV_M = 5.0
 
 private enum class Screen { RECORDER, SETTINGS }
+
+private const val PREFS_NAME = "mango_detour_settings"
+private const val PREF_LOG_INTERVAL_SECONDS = "log_interval_seconds"
+private const val PREF_VACC_FOR_ALPHA_05 = "vacc_for_alpha_05"
 
 /**
  * One raw, unprocessed log row (plus the dynamic-EMA-smoothed variant of
@@ -124,9 +127,14 @@ class MainActivity : ComponentActivity() {
     private var currentAccuracyM by mutableStateOf<Float?>(null)
     private var currentScreen by mutableStateOf(Screen.RECORDER)
 
-    // User-configurable free variables (Settings screen).
+    // User-configurable free variables (Settings screen), persisted across app restarts.
+    private val prefs by lazy { getSharedPreferences(PREFS_NAME, MODE_PRIVATE) }
     private var logIntervalSeconds by mutableStateOf(DEFAULT_LOG_INTERVAL_SECONDS)
     private var vAccForAlpha05 by mutableStateOf(DEFAULT_VACC_FOR_ALPHA_05)
+
+    private fun saveSetting(key: String, value: Double) {
+        prefs.edit().putFloat(key, value.toFloat()).apply()
+    }
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -140,6 +148,9 @@ class MainActivity : ComponentActivity() {
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         ElevationClient.init(this)
         geoidModel = GeoidModel(this)
+
+        logIntervalSeconds = prefs.getFloat(PREF_LOG_INTERVAL_SECONDS, DEFAULT_LOG_INTERVAL_SECONDS.toFloat()).toDouble()
+        vAccForAlpha05 = prefs.getFloat(PREF_VACC_FOR_ALPHA_05, DEFAULT_VACC_FOR_ALPHA_05.toFloat()).toDouble()
 
         setContent {
             MaterialTheme {
@@ -156,8 +167,14 @@ class MainActivity : ComponentActivity() {
                         Screen.SETTINGS -> SettingsScreen(
                             logIntervalSeconds = logIntervalSeconds,
                             vAccForAlpha05 = vAccForAlpha05,
-                            onLogIntervalChange = { logIntervalSeconds = it },
-                            onVAccChange = { vAccForAlpha05 = it },
+                            onLogIntervalChange = {
+                                logIntervalSeconds = it
+                                saveSetting(PREF_LOG_INTERVAL_SECONDS, it)
+                            },
+                            onVAccChange = {
+                                vAccForAlpha05 = it
+                                saveSetting(PREF_VACC_FOR_ALPHA_05, it)
+                            },
                             onBack = { currentScreen = Screen.RECORDER },
                         )
                     }
@@ -447,12 +464,14 @@ private fun SettingsScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                "Settings",
+                modifier = Modifier.weight(1f).padding(top = 12.dp),
+            )
             Button(onClick = onBack) {
-                Text("\u2190") // back arrow
+                Text("\u00D7") // close (×)
             }
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Settings")
         }
 
         Spacer(modifier = Modifier.height(24.dp))

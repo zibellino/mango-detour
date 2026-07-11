@@ -208,7 +208,6 @@ class MainActivity : ComponentActivity() {
         logRows.clear()
         originLat = null
         originLon = null
-        emaState.clear()
         dynamicEmaState = null
 
         isRecording = true

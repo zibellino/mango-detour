@@ -12,6 +12,30 @@ import java.util.zip.GZIPInputStream
 import kotlin.math.floor
 
 /**
+ * Result of an SRTM lookup: the interpolated elevation, the 4 raw corner
+ * samples it was interpolated from (s00=NW, s10=NE, s01=SW, s11=SE), and
+ * an estimate of how much bilinear interpolation error is plausible at
+ * this specific point within the cell.
+ *
+ * errorEstimate is derived from the saddle ("twist") term of the bilinear
+ * formula: twist = s11 - s10 - s01 + s00. A perfectly planar cell has
+ * twist=0 (bilinear interpolation is then exact everywhere in the cell,
+ * even at the center). A saddled/twisted cell has twist != 0, and the
+ * resulting interpolation error peaks at the cell center and is zero at
+ * the corners — captured by the x(1-x)*y(1-y) term below, which is 0 at
+ * every corner and maximized (0.25) at the center; the *4 normalizes so
+ * errorEstimate's ceiling equals |twist| itself, right at the center.
+ */
+data class SrtmSample(
+    val elevation: Double,
+    val cornerNW: Double,
+    val cornerNE: Double,
+    val cornerSW: Double,
+    val cornerSE: Double,
+    val errorEstimate: Double,
+)
+
+/**
  * Looks up ground elevation from SRTM1 (30m) tiles, downloaded on demand
  * from AWS's public "elevation-tiles-prod" bucket (Mapzen's Skadi layout)
  * and cached locally. No API key, no billing, no per-caller rate limit —
@@ -37,10 +61,14 @@ class SrtmElevationProvider(context: Context) {
      * if the tile couldn't be fetched or the samples nearest to the point
      * are void (e.g. over open ocean in some SRTM gaps).
      */
-    suspend fun getElevation(lat: Double, lon: Double): Double? = withContext(Dispatchers.IO) {
+    suspend fun getElevation(lat: Double, lon: Double): Double? =
+        getSample(lat, lon)?.elevation
+
+    /** Same as getElevation, but also returns the 4 corners and an interpolation error estimate. */
+    suspend fun getSample(lat: Double, lon: Double): SrtmSample? = withContext(Dispatchers.IO) {
         val tileName = tileName(lat, lon)
         val tileFile = ensureTileCached(tileName) ?: return@withContext null
-        readInterpolatedElevation(tileFile, lat, lon)
+        readInterpolatedSample(tileFile, lat, lon)
     }
 
     // --- Tile naming -------------------------------------------------
@@ -95,7 +123,7 @@ class SrtmElevationProvider(context: Context) {
 
     // --- Local lookup ---------------------------------------------------
 
-    private fun readInterpolatedElevation(tileFile: File, lat: Double, lon: Double): Double? {
+    private fun readInterpolatedSample(tileFile: File, lat: Double, lon: Double): SrtmSample? {
         val tileLat = floor(lat)
         val tileLon = floor(lon)
 
@@ -116,15 +144,29 @@ class SrtmElevationProvider(context: Context) {
         val tCol = colF - col0
 
         RandomAccessFile(tileFile, "r").use { raf ->
-            val s00 = readSample(raf, row0, col0) ?: return null
-            val s01 = readSample(raf, row0, col1) ?: return null
-            val s10 = readSample(raf, row1, col0) ?: return null
-            val s11 = readSample(raf, row1, col1) ?: return null
+            val s00 = readSample(raf, row0, col0) ?: return null // NW
+            val s01 = readSample(raf, row0, col1) ?: return null // NE
+            val s10 = readSample(raf, row1, col0) ?: return null // SW
+            val s11 = readSample(raf, row1, col1) ?: return null // SE
 
             // Bilinear interpolation between the four surrounding samples.
             val top = s00 * (1 - tCol) + s01 * tCol
             val bottom = s10 * (1 - tCol) + s11 * tCol
-            return top * (1 - tRow) + bottom * tRow
+            val elevation = top * (1 - tRow) + bottom * tRow
+
+            // Saddle/twist term: 0 for a planar cell, nonzero for a
+            // saddled one. See SrtmSample's doc comment for the math.
+            val twist = s11 - s10 - s01 + s00
+            val errorEstimate = kotlin.math.abs(twist) * tCol * (1 - tCol) * tRow * (1 - tRow) * 4.0
+
+            return SrtmSample(
+                elevation = elevation,
+                cornerNW = s00,
+                cornerNE = s01,
+                cornerSW = s10,
+                cornerSE = s11,
+                errorEstimate = errorEstimate,
+            )
         }
     }
 

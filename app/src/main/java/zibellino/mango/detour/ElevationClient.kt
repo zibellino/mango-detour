@@ -34,4 +34,10 @@ object ElevationClient {
         withContext(Dispatchers.IO) {
             provider?.getElevation(latitude, longitude)
         }
+
+    /** Returns the full sample (elevation, 4 corners, error estimate), or null if the lookup failed. */
+    suspend fun fetchSample(latitude: Double, longitude: Double): SrtmSample? =
+        withContext(Dispatchers.IO) {
+            provider?.getSample(latitude, longitude)
+        }
 }

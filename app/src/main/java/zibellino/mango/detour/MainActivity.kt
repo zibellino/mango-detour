@@ -9,16 +9,20 @@ import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -43,17 +47,14 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.cos
 
-private const val LOG_INTERVAL_MS = 5_000L
 private const val METERS_PER_DEGREE_LAT = 111_320.0
 
 /** Minimum horizontal accuracy (meters) before we let the user start recording. */
 private const val READY_ACCURACY_THRESHOLD_M = 10f
 
-// Dynamic EMA: alpha = REF_VARIANCE / (REF_VARIANCE + accuracy^2), tuned so
-// accuracy == 2m gives alpha == 0.5 (REF_VARIANCE = 2^2 = 4). Same shape as
-// a Kalman gain — trust the new fix more when it's precise, lean on
-// history more when it's not.
-private const val EMA_REF_VARIANCE = 4.0
+/** Defaults for the user-configurable settings below. */
+private const val DEFAULT_LOG_INTERVAL_SECONDS = 5.0
+private const val DEFAULT_VACC_FOR_ALPHA_05 = 2.0
 
 // Location.verticalAccuracyMeters isn't always populated (device/OS
 // dependent). When it's missing we fall back to horizontal accuracy
@@ -67,14 +68,14 @@ private const val VERTICAL_ACCURACY_FALLBACK_MULTIPLIER = 1.75f
 // Deliberately a fixed constant, not a per-cell roughness estimate.
 private const val SRTM_VERTICAL_STDDEV_M = 5.0
 
+private enum class Screen { RECORDER, SETTINGS }
+
 /**
- * One raw, unprocessed log row (plus the EMA-smoothed variants of
+ * One raw, unprocessed log row (plus the dynamic-EMA-smoothed variant of
  * gpsAltCorrected). No barometer — dropped after testing showed it wasn't
- * earning its complexity: its short-term precision was fine, but its
- * absolute drift meant it never improved on already-good corrected GPS,
- * and this app's outdoor use case rarely stresses GPS enough to need a
- * fallback source. SRTM stays logged for now while the large mismatch
- * against gpsAltCorrected in some sessions is still being investigated.
+ * earning its complexity. SRTM stays logged, now with its 4 raw corners
+ * and a bilinear-interpolation error estimate, while the mismatch against
+ * gpsAltCorrected in some sessions is still being investigated.
  */
 data class LogRow(
     val timestampMillis: Long,
@@ -121,6 +122,11 @@ class MainActivity : ComponentActivity() {
     private var isRecording by mutableStateOf(false)
     private var isLocationReady by mutableStateOf(false)
     private var currentAccuracyM by mutableStateOf<Float?>(null)
+    private var currentScreen by mutableStateOf(Screen.RECORDER)
+
+    // User-configurable free variables (Settings screen).
+    private var logIntervalSeconds by mutableStateOf(DEFAULT_LOG_INTERVAL_SECONDS)
+    private var vAccForAlpha05 by mutableStateOf(DEFAULT_VACC_FOR_ALPHA_05)
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -138,13 +144,23 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    RecorderScreen(
-                        isRecording = isRecording,
-                        isLocationReady = isLocationReady,
-                        currentAccuracyM = currentAccuracyM,
-                        rows = logRows,
-                        onToggle = ::onToggleClicked,
-                    )
+                    when (currentScreen) {
+                        Screen.RECORDER -> RecorderScreen(
+                            isRecording = isRecording,
+                            isLocationReady = isLocationReady,
+                            currentAccuracyM = currentAccuracyM,
+                            rows = logRows,
+                            onToggle = ::onToggleClicked,
+                            onOpenSettings = { currentScreen = Screen.SETTINGS },
+                        )
+                        Screen.SETTINGS -> SettingsScreen(
+                            logIntervalSeconds = logIntervalSeconds,
+                            vAccForAlpha05 = vAccForAlpha05,
+                            onLogIntervalChange = { logIntervalSeconds = it },
+                            onVAccChange = { vAccForAlpha05 = it },
+                            onBack = { currentScreen = Screen.RECORDER },
+                        )
+                    }
                 }
             }
         }
@@ -163,9 +179,9 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Starts GNSS as soon as we have permission — well before the user
-     * taps "Start Recording" — so it's had time to converge by then.
-     * isLocationReady gates the Start button so the user isn't recording
-     * garbage fixes from a cold GNSS lock.
+     * taps Start — so it's had time to converge by then. isLocationReady
+     * gates the Start button so the user isn't recording garbage fixes
+     * from a cold GNSS lock.
      */
     private fun startLocationWarmup() {
         val hasPermission = ContextCompat.checkSelfPermission(
@@ -216,14 +232,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun scheduleLogging() {
+        val intervalMs = (logIntervalSeconds * 1000.0).toLong().coerceAtLeast(100L)
         val runnable = object : Runnable {
             override fun run() {
                 takeLogRow()
-                logHandler.postDelayed(this, LOG_INTERVAL_MS)
+                logHandler.postDelayed(this, intervalMs)
             }
         }
         logRunnable = runnable
-        logHandler.postDelayed(runnable, LOG_INTERVAL_MS)
+        logHandler.postDelayed(runnable, intervalMs)
     }
 
     private fun takeLogRow() {
@@ -245,7 +262,10 @@ class MainActivity : ComponentActivity() {
         val vAccuracy = if (location.hasVerticalAccuracy()) location.verticalAccuracyMeters else null
         val accuracyForEma = vAccuracy ?: hAccuracy?.times(VERTICAL_ACCURACY_FALLBACK_MULTIPLIER)
 
-        // Dynamic EMA: alpha derived from this fix's own accuracy rather than fixed.
+        // Dynamic EMA: alpha = refVariance / (refVariance + accuracy^2),
+        // where refVariance = vAccForAlpha05^2 (the user-configured point
+        // at which alpha == 0.5). Same shape as a Kalman gain.
+        val emaRefVariance = vAccForAlpha05 * vAccForAlpha05
         if (correctedGpsAltitude != null) {
             val previous = dynamicEmaState
             dynamicEmaState = if (previous == null) {
@@ -253,7 +273,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 val accuracy = accuracyForEma
                 if (accuracy != null) {
-                    val alpha = EMA_REF_VARIANCE / (EMA_REF_VARIANCE + accuracy * accuracy)
+                    val alpha = emaRefVariance / (emaRefVariance + accuracy * accuracy)
                     alpha * correctedGpsAltitude + (1 - alpha) * previous
                 } else {
                     // No accuracy info at all this fix — fall back to a neutral 0.5.
@@ -367,23 +387,31 @@ private fun RecorderScreen(
     currentAccuracyM: Float?,
     rows: List<LogRow>,
     onToggle: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Button(
-            onClick = onToggle,
-            enabled = isRecording || isLocationReady,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(
-                when {
-                    isRecording -> "Stop Recording"
-                    isLocationReady -> "Start Recording"
-                    else -> "Waiting for GPS fix..."
-                },
-            )
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = onToggle,
+                enabled = isRecording || isLocationReady,
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("\u23EF") // play/pause symbol
+            }
+            Button(
+                onClick = onOpenSettings,
+                enabled = !isRecording,
+            ) {
+                Text("\u2699") // gear symbol
+            }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
+
+        if (!isRecording && !isLocationReady) {
+            Text("Waiting for GPS fix...")
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         currentAccuracyM?.let {
             Text("Current fix accuracy: ±%.1fm".format(it))
@@ -400,6 +428,56 @@ private fun RecorderScreen(
                 Spacer(modifier = Modifier.height(6.dp))
             }
         }
+    }
+}
+
+@Composable
+private fun SettingsScreen(
+    logIntervalSeconds: Double,
+    vAccForAlpha05: Double,
+    onLogIntervalChange: (Double) -> Unit,
+    onVAccChange: (Double) -> Unit,
+    onBack: () -> Unit,
+) {
+    var logIntervalText by androidx.compose.runtime.remember {
+        androidx.compose.runtime.mutableStateOf(logIntervalSeconds.toString())
+    }
+    var vAccText by androidx.compose.runtime.remember {
+        androidx.compose.runtime.mutableStateOf(vAccForAlpha05.toString())
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Button(onClick = onBack) {
+                Text("\u2190") // back arrow
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Settings")
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Text("Sampling rate (seconds)")
+        OutlinedTextField(
+            value = logIntervalText,
+            onValueChange = { text ->
+                logIntervalText = text
+                text.toDoubleOrNull()?.let { if (it > 0) onLogIntervalChange(it) }
+            },
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Text("vAcc (m) for dynamic EMA alpha = 0.5")
+        OutlinedTextField(
+            value = vAccText,
+            onValueChange = { text ->
+                vAccText = text
+                text.toDoubleOrNull()?.let { if (it > 0) onVAccChange(it) }
+            },
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 

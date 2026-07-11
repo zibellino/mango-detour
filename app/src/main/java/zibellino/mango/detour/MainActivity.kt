@@ -51,6 +51,17 @@ private const val READY_ACCURACY_THRESHOLD_M = 10f
 
 private val EMA_ALPHAS = listOf(0.4, 0.5, 0.6)
 
+// Dynamic EMA: alpha = REF_VARIANCE / (REF_VARIANCE + accuracy^2), tuned so
+// accuracy == 2m gives alpha == 0.5 (REF_VARIANCE = 2^2 = 4). Same shape as
+// a Kalman gain — trust the new fix more when it's precise, lean on
+// history more when it's not.
+private const val EMA_REF_VARIANCE = 4.0
+
+// Location.verticalAccuracyMeters isn't always populated (device/OS
+// dependent). When it's missing we fall back to horizontal accuracy
+// scaled up, since vertical GNSS error is typically ~1.5-2x horizontal.
+private const val VERTICAL_ACCURACY_FALLBACK_MULTIPLIER = 1.75f
+
 /**
  * One raw, unprocessed log row (plus the EMA-smoothed variants of
  * gpsAltCorrected). No barometer — dropped after testing showed it wasn't
@@ -69,7 +80,10 @@ data class LogRow(
     val gpsAltitude: Double?,
     val correctedGpsAltitude: Double?,
     val srtmElevation: Double?,
+    val hAccuracyM: Float?,
+    val vAccuracyM: Float?,
     val emaByAlpha: Map<Double, Double?>,
+    val dynamicEma: Double?,
 )
 
 class MainActivity : ComponentActivity() {
@@ -88,8 +102,9 @@ class MainActivity : ComponentActivity() {
     private var originLat: Double? = null
     private var originLon: Double? = null
 
-    // Running EMA state per alpha, keyed the same as EMA_ALPHAS.
+    // Running EMA state per fixed alpha, keyed the same as EMA_ALPHAS.
     private val emaState = mutableMapOf<Double, Double>()
+    private var dynamicEmaState: Double? = null
 
     private var locationCallback: LocationCallback? = null
 
@@ -185,6 +200,7 @@ class MainActivity : ComponentActivity() {
         originLat = null
         originLon = null
         emaState.clear()
+        dynamicEmaState = null
 
         isRecording = true
         takeLogRow() // log immediately, then settle into the periodic interval
@@ -217,7 +233,11 @@ class MainActivity : ComponentActivity() {
         val correctedGpsAltitude = gpsAltitude?.let { it - geoidModel.undulationMeters(lat, lng) }
         val timestamp = System.currentTimeMillis()
 
-        // Update each EMA(alpha) with the latest corrected GPS altitude, if we have one.
+        val hAccuracy = if (location.hasAccuracy()) location.accuracy else null
+        val vAccuracy = if (location.hasVerticalAccuracy()) location.verticalAccuracyMeters else null
+        val accuracyForEma = vAccuracy ?: hAccuracy?.times(VERTICAL_ACCURACY_FALLBACK_MULTIPLIER)
+
+        // Update each fixed EMA(alpha) with the latest corrected GPS altitude, if we have one.
         val emaSnapshot = mutableMapOf<Double, Double?>()
         if (correctedGpsAltitude != null) {
             for (alpha in EMA_ALPHAS) {
@@ -234,6 +254,23 @@ class MainActivity : ComponentActivity() {
             for (alpha in EMA_ALPHAS) emaSnapshot[alpha] = emaState[alpha]
         }
 
+        // Dynamic EMA: alpha derived from this fix's own accuracy rather than fixed.
+        if (correctedGpsAltitude != null) {
+            val previous = dynamicEmaState
+            dynamicEmaState = if (previous == null) {
+                correctedGpsAltitude
+            } else {
+                val accuracy = accuracyForEma
+                if (accuracy != null) {
+                    val alpha = EMA_REF_VARIANCE / (EMA_REF_VARIANCE + accuracy * accuracy)
+                    alpha * correctedGpsAltitude + (1 - alpha) * previous
+                } else {
+                    // No accuracy info at all this fix — fall back to a neutral 0.5.
+                    0.5 * correctedGpsAltitude + 0.5 * previous
+                }
+            }
+        }
+
         lifecycleScope.launch {
             val srtmElevation = ElevationClient.fetchElevation(lat, lng)
             logRows.add(
@@ -247,7 +284,10 @@ class MainActivity : ComponentActivity() {
                     gpsAltitude = gpsAltitude,
                     correctedGpsAltitude = correctedGpsAltitude,
                     srtmElevation = srtmElevation,
+                    hAccuracyM = hAccuracy,
+                    vAccuracyM = vAccuracy,
                     emaByAlpha = emaSnapshot,
+                    dynamicEma = dynamicEmaState,
                 ),
             )
         }
@@ -356,11 +396,15 @@ private fun formatRow(row: LogRow): String {
     val gps = row.gpsAltitude?.let { "%.2f".format(it) } ?: "-"
     val gpsCorrected = row.correctedGpsAltitude?.let { "%.2f".format(it) } ?: "-"
     val srtm = row.srtmElevation?.let { "%.2f".format(it) } ?: "-"
+    val hAcc = row.hAccuracyM?.let { "%.1f".format(it) } ?: "-"
+    val vAcc = row.vAccuracyM?.let { "%.1f".format(it) } ?: "-"
     val ema04 = row.emaByAlpha[0.4]?.let { "%.2f".format(it) } ?: "-"
     val ema05 = row.emaByAlpha[0.5]?.let { "%.2f".format(it) } ?: "-"
     val ema06 = row.emaByAlpha[0.6]?.let { "%.2f".format(it) } ?: "-"
+    val emaDyn = row.dynamicEma?.let { "%.2f".format(it) } ?: "-"
     return ("[$time] lat=%.6f lng=%.6f  x=%.1fm y=%.1fm\n" +
         "  gpsAlt=$gps  gpsAltCorrected=$gpsCorrected  srtmElev=$srtm\n" +
-        "  ema0.4=$ema04  ema0.5=$ema05  ema0.6=$ema06")
+        "  hAcc=$hAcc  vAcc=$vAcc\n" +
+        "  ema0.4=$ema04  ema0.5=$ema05  ema0.6=$ema06  emaDynamic=$emaDyn")
         .format(row.lat, row.lng, row.xMeters, row.yMeters)
 }
